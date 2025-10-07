@@ -1027,3 +1027,1003 @@ spring.flyway.enabled=false
 spring.flyway.enabled=true
 
 # Other instances with migrations disabled
+spring.flyway.enabled=false
+```
+**Pros**: Gradual rollout, can catch issues early
+**Cons**: More complex deployment process
+
+---
+
+## **11. Troubleshooting Guide**
+
+### **11.1 Common Errors & Solutions**
+
+#### **Error: "Checksum mismatch"**
+
+```
+ERROR: Migration checksum mismatch for migration version 1
+Applied to database : 123456789
+Resolved locally    : 987654321
+```
+
+**Cause**: Someone modified an already-applied migration file.
+
+**Solution**:
+```bash
+# Option 1: Revert the file to original (PREFERRED)
+git checkout HEAD~1 -- src/main/resources/db/migration/V1__*.sql
+
+# Option 2: Repair the checksum (USE WITH CAUTION)
+flyway repair
+
+# Option 3: Accept the new checksum (DANGEROUS)
+spring.flyway.validate-on-migrate=false  # Temporary
+```
+
+**Prevention**:
+- Never modify applied migrations
+- Use code reviews
+- Lock migration files after applying to production
+
+#### **Error: "Migration failed"**
+
+```
+ERROR: Migration V5__add_column.sql failed
+SQL State  : 42P01
+Error Code : 0
+Message    : ERROR: relation "users" does not exist
+```
+
+**Solution**:
+```sql
+-- Check flyway_schema_history
+SELECT * FROM flyway_schema_history WHERE success = false;
+
+-- Fix the migration file
+-- Then repair and retry
+flyway repair
+flyway migrate
+```
+
+#### **Error: "Out of order migration detected"**
+
+```
+ERROR: Detected resolved migration not applied to database: 2.5
+Conflicting with migration version: 3.0
+```
+
+**Cause**: Someone created V2.5 after V3.0 was already applied.
+
+**Solution**:
+```yaml
+# Development only - allow out-of-order
+spring.flyway.out-of-order=true
+
+# Better: Rename to V4__description.sql
+# Production: Never allow out-of-order
+```
+
+#### **Error: "Failed to obtain JDBC connection"**
+
+```
+ERROR: Unable to obtain connection from database
+```
+
+**Solution**:
+```yaml
+# Check datasource configuration
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/mydb
+    username: ${DB_USERNAME}  # From environment variable
+    password: ${DB_PASSWORD}
+    hikari:
+      maximum-pool-size: 5
+      connection-timeout: 30000
+      
+# Verify database is running
+# Check network connectivity
+# Verify credentials
+```
+
+### **11.2 Debugging Tips**
+
+**Enable verbose logging:**
+```yaml
+logging:
+  level:
+    org.flywaydb: DEBUG
+    org.springframework.jdbc: DEBUG
+```
+
+**Check migration status:**
+```sql
+-- See all migrations
+SELECT 
+    installed_rank,
+    version,
+    description,
+    type,
+    script,
+    success,
+    execution_time,
+    installed_on
+FROM flyway_schema_history
+ORDER BY installed_rank;
+
+-- Find failed migrations
+SELECT * FROM flyway_schema_history WHERE success = false;
+
+-- Find pending migrations (check application logs)
+```
+
+**Validate migrations without applying:**
+```bash
+flyway validate
+flyway info  # Shows pending migrations
+```
+
+### **11.3 Recovery Procedures**
+
+**Scenario: Production migration failed mid-execution**
+
+```bash
+# Step 1: Assess the damage
+SELECT * FROM flyway_schema_history WHERE success = false;
+
+# Step 2: Check what was actually applied
+# Review database schema manually
+
+# Step 3: Fix the migration file
+# Make it idempotent or fix the error
+
+# Step 4: Repair Flyway state
+flyway repair
+
+# Step 5: Retry migration
+flyway migrate
+
+# Step 6: Verify success
+SELECT * FROM flyway_schema_history ORDER BY installed_rank DESC LIMIT 5;
+```
+
+**Scenario: Need to rollback a migration**
+
+```sql
+-- Flyway doesn't auto-rollback, so create a new migration
+
+-- Original: V10__add_column.sql
+ALTER TABLE users ADD COLUMN middle_name VARCHAR(100);
+
+-- Rollback: V11__remove_middle_name.sql
+ALTER TABLE users DROP COLUMN middle_name;
+```
+
+---
+
+## **12. Performance Optimization**
+
+### **12.1 Large Table Migrations**
+
+**Problem**: Adding a column to a 100M row table locks it for hours.
+
+**Solution: Use multiple steps**
+
+```sql
+-- V10__add_column_step1.sql
+-- Add column as nullable (instant operation)
+ALTER TABLE large_table ADD COLUMN new_column VARCHAR(255) NULL;
+
+-- V11__add_column_step2.sql
+-- Backfill in batches to avoid locks
+DO $
+DECLARE
+    batch_size INTEGER := 10000;
+    offset_val INTEGER := 0;
+    rows_updated INTEGER;
+BEGIN
+    LOOP
+        UPDATE large_table
+        SET new_column = compute_value(id)
+        WHERE id IN (
+            SELECT id FROM large_table
+            WHERE new_column IS NULL
+            ORDER BY id
+            LIMIT batch_size
+        );
+        
+        GET DIAGNOSTICS rows_updated = ROW_COUNT;
+        EXIT WHEN rows_updated = 0;
+        
+        -- Commit batch
+        COMMIT;
+        
+        -- Small delay to allow other queries
+        PERFORM pg_sleep(0.1);
+    END LOOP;
+END $;
+
+-- V12__add_column_step3.sql
+-- Make NOT NULL after backfill completes
+ALTER TABLE large_table ALTER COLUMN new_column SET NOT NULL;
+```
+
+### **12.2 Index Creation Best Practices**
+
+```sql
+-- ❌ BAD: Locks table during creation
+CREATE INDEX idx_users_email ON users(email);
+
+-- ✅ GOOD: Non-blocking index creation (PostgreSQL)
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_users_email ON users(email);
+
+-- For very large tables, consider:
+-- 1. Create index during low-traffic window
+-- 2. Monitor index creation progress
+SELECT 
+    now()::TIME,
+    query,
+    state,
+    wait_event_type,
+    wait_event
+FROM pg_stat_activity
+WHERE query LIKE '%CREATE INDEX%';
+```
+
+### **12.3 Migration Execution Time**
+
+**Estimate before running:**
+
+```sql
+-- Test on copy of production database
+EXPLAIN ANALYZE
+ALTER TABLE users ADD COLUMN new_field VARCHAR(255);
+
+-- Expected output:
+-- Execution Time: 0.123 ms (for schema change)
+-- Note: Actual time depends on table size and row rewrite
+```
+
+**Set timeouts:**
+
+```yaml
+spring:
+  flyway:
+    lock-retry-count: 50
+    
+  datasource:
+    hikari:
+      connection-timeout: 60000
+      validation-timeout: 5000
+```
+
+---
+
+## **13. Security Best Practices**
+
+### **13.1 Credential Management**
+
+**❌ NEVER do this:**
+```yaml
+spring:
+  datasource:
+    username: admin
+    password: secretpassword123  # Hardcoded!
+```
+
+**✅ Use environment variables:**
+```yaml
+spring:
+  datasource:
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+```
+
+**✅ Or use secrets management:**
+```java
+@Configuration
+public class DataSourceConfig {
+    
+    @Bean
+    public DataSource dataSource(
+            @Value("${aws.secretsmanager.secret-name}") String secretName) {
+        
+        // Fetch credentials from AWS Secrets Manager
+        String credentials = awsSecretsManager.getSecret(secretName);
+        
+        return DataSourceBuilder.create()
+            .url(extractUrl(credentials))
+            .username(extractUsername(credentials))
+            .password(extractPassword(credentials))
+            .build();
+    }
+}
+```
+
+### **13.2 Migration Security**
+
+```sql
+-- ❌ BAD: Exposing sensitive data in migration
+INSERT INTO users (email, password) VALUES ('admin@example.com', 'admin123');
+
+-- ✅ GOOD: Use placeholders or secure injection
+INSERT INTO users (email, password_hash) 
+VALUES ('${admin.email}', crypt('${admin.password}', gen_salt('bf')));
+```
+
+### **13.3 Database User Permissions**
+
+**Principle of Least Privilege:**
+
+```sql
+-- Create dedicated Flyway user
+CREATE USER flyway_user WITH PASSWORD 'secure_random_password';
+
+-- Grant only necessary permissions
+GRANT CONNECT ON DATABASE mydb TO flyway_user;
+GRANT USAGE ON SCHEMA public TO flyway_user;
+GRANT CREATE ON SCHEMA public TO flyway_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO flyway_user;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO flyway_user;
+
+-- Application user (read/write only, no schema changes)
+CREATE USER app_user WITH PASSWORD 'different_secure_password';
+GRANT CONNECT ON DATABASE mydb TO app_user;
+GRANT USAGE ON SCHEMA public TO app_user;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_user;
+```
+
+**Configuration:**
+```yaml
+# Use flyway_user only for migrations
+spring:
+  flyway:
+    user: flyway_user
+    password: ${FLYWAY_PASSWORD}
+    
+  # Use app_user for application runtime
+  datasource:
+    username: app_user
+    password: ${APP_PASSWORD}
+```
+
+---
+
+## **14. Testing Migrations**
+
+### **14.1 Unit Testing Migrations**
+
+```java
+@SpringBootTest
+@TestPropertySource(properties = {
+    "spring.flyway.clean-disabled=false"
+})
+class FlywayMigrationTest {
+    
+    @Autowired
+    private Flyway flyway;
+    
+    @Autowired
+    private JdbcTemplate jdbcTemplate;
+    
+    @Test
+    void shouldApplyAllMigrations() {
+        // Clean and migrate
+        flyway.clean();
+        MigrateResult result = flyway.migrate();
+        
+        // Verify all migrations succeeded
+        assertThat(result.success).isTrue();
+        assertThat(result.migrationsExecuted).isGreaterThan(0);
+    }
+    
+    @Test
+    void shouldHaveExpectedSchema() {
+        // Verify tables exist
+        Integer count = jdbcTemplate.queryForObject(
+            "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'users'",
+            Integer.class
+        );
+        assertThat(count).isEqualTo(1);
+        
+        // Verify columns exist
+        List<String> columns = jdbcTemplate.queryForList(
+            "SELECT column_name FROM information_schema.columns WHERE table_name = 'users'",
+            String.class
+        );
+        assertThat(columns).contains("id", "username", "email", "created_at");
+    }
+    
+    @Test
+    void shouldValidateMigrationChecksums() {
+        // This will fail if any migration file was modified
+        assertThatCode(() -> flyway.validate())
+            .doesNotThrowAnyException();
+    }
+}
+```
+
+### **14.2 Integration Testing**
+
+```java
+@SpringBootTest
+@Sql(scripts = "/test-data.sql", executionPhase = BEFORE_TEST_METHOD)
+class DatabaseIntegrationTest {
+    
+    @Autowired
+    private UserRepository userRepository;
+    
+    @Test
+    void shouldWorkWithMigratedSchema() {
+        // Test that application code works with current schema
+        User user = new User("testuser", "test@example.com");
+        User saved = userRepository.save(user);
+        
+        assertThat(saved.getId()).isNotNull();
+        assertThat(saved.getCreatedAt()).isNotNull();
+    }
+}
+```
+
+### **14.3 Backward Compatibility Testing**
+
+```java
+@SpringBootTest
+class BackwardCompatibilityTest {
+    
+    @Autowired
+    private Flyway flyway;
+    
+    @Test
+    void oldApplicationShouldWorkWithNewSchema() {
+        // Scenario: New migration adds optional column
+        // Old application code should still work
+        
+        // Run new migration
+        flyway.migrate();
+        
+        // Test with old-style code (without new column)
+        jdbcTemplate.update(
+            "INSERT INTO users (username, email) VALUES (?, ?)",
+            "olduser", "old@example.com"
+        );
+        
+        // Should succeed (new column has default/null)
+        Integer count = jdbcTemplate.queryForObject(
+            "SELECT COUNT(*) FROM users WHERE username = 'olduser'",
+            Integer.class
+        );
+        assertThat(count).isEqualTo(1);
+    }
+}
+```
+
+### **14.4 Performance Testing**
+
+```java
+@SpringBootTest
+class MigrationPerformanceTest {
+    
+    @Test
+    void migrationShouldCompleteInReasonableTime() {
+        long startTime = System.currentTimeMillis();
+        
+        flyway.clean();
+        flyway.migrate();
+        
+        long duration = System.currentTimeMillis() - startTime;
+        
+        // All migrations should complete in < 5 seconds on empty database
+        assertThat(duration).isLessThan(5000);
+    }
+    
+    @Test
+    void migrationShouldHandleLargeDataset() {
+        // Insert test data
+        for (int i = 0; i < 100000; i++) {
+            jdbcTemplate.update(
+                "INSERT INTO users (username, email) VALUES (?, ?)",
+                "user" + i, "user" + i + "@example.com"
+            );
+        }
+        
+        // Run migration that affects all rows
+        long startTime = System.currentTimeMillis();
+        flyway.migrate();
+        long duration = System.currentTimeMillis() - startTime;
+        
+        // Should complete in reasonable time
+        assertThat(duration).isLessThan(30000); // 30 seconds
+    }
+}
+```
+
+---
+
+## **15. Flyway vs Liquibase: Detailed Comparison**
+
+| Feature | Flyway | Liquibase |
+|---------|--------|-----------|
+| **Learning Curve** | ⭐⭐⭐⭐⭐ Simple | ⭐⭐⭐ Moderate |
+| **Configuration** | Convention-based, minimal | XML/YAML/JSON-based, verbose |
+| **SQL Support** | Native SQL files | ChangeSet abstractions |
+| **Database Support** | 20+ databases | 40+ databases |
+| **Rollback** | Manual (create new migration) | Automatic with pro version |
+| **Versioning** | Version numbers | ChangeSets with IDs |
+| **Team Size** | Better for small-medium teams | Better for large enterprises |
+| **Flexibility** | Less flexible, more opinionated | Highly flexible |
+| **Spring Boot Integration** | Native, seamless | Requires more configuration |
+| **Community** | Large, active | Very large, active |
+| **Commercial Features** | Flyway Teams (paid) | Liquibase Pro (paid) |
+| **Best For** | SQL-first approach, Spring Boot | Complex enterprise needs |
+
+### **When to Choose Flyway:**
+- ✅ You prefer writing SQL directly
+- ✅ Using Spring Boot
+- ✅ Want minimal configuration
+- ✅ Small to medium projects
+- ✅ Simple rollback needs
+
+### **When to Choose Liquibase:**
+- ✅ Need automatic rollbacks
+- ✅ Database-agnostic changesets
+- ✅ Complex enterprise requirements
+- ✅ Need preconditions and contexts
+- ✅ Large, complex projects
+
+---
+
+## **16. Migration Patterns & Anti-Patterns**
+
+### **16.1 Good Patterns ✅**
+
+#### **Pattern: Idempotent Migrations**
+```sql
+-- Always safe to run multiple times
+CREATE TABLE IF NOT EXISTS users (...);
+
+CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
+
+INSERT INTO config (key, value) 
+VALUES ('version', '1.0')
+ON CONFLICT (key) DO NOTHING;
+```
+
+#### **Pattern: Explicit Transaction Control**
+```sql
+-- For operations that need separate transactions
+BEGIN;
+CREATE TABLE orders (...);
+COMMIT;
+
+BEGIN;
+CREATE INDEX idx_orders_user ON orders(user_id);
+COMMIT;
+```
+
+#### **Pattern: Safe Column Addition**
+```sql
+-- Phase 1: Add nullable column
+ALTER TABLE users ADD COLUMN phone VARCHAR(20);
+
+-- Phase 2: Populate data
+UPDATE users SET phone = '000-000-0000' WHERE phone IS NULL;
+
+-- Phase 3: Make NOT NULL (separate migration after verification)
+-- ALTER TABLE users ALTER COLUMN phone SET NOT NULL;
+```
+
+### **16.2 Anti-Patterns ❌**
+
+#### **Anti-Pattern: Modifying Applied Migrations**
+```sql
+-- ❌ NEVER modify V1__create_users.sql after it's applied
+-- ✅ Create V2__modify_users.sql instead
+```
+
+#### **Anti-Pattern: Coupling Migrations to Application Code**
+```sql
+-- ❌ BAD: Migration depends on application logic
+-- V5__complex_migration.sql
+-- SELECT * FROM users WHERE status = 'PREMIUM';
+-- Problem: What if 'PREMIUM' constant changes in code?
+
+-- ✅ GOOD: Self-contained migrations
+SELECT * FROM users WHERE status = 'P';  -- Use DB values
+```
+
+#### **Anti-Pattern: Large Transactions**
+```sql
+-- ❌ BAD: Single transaction for millions of rows
+UPDATE large_table SET computed_value = expensive_function(id);
+
+-- ✅ GOOD: Batch processing
+DO $
+BEGIN
+    LOOP
+        UPDATE large_table 
+        SET computed_value = expensive_function(id)
+        WHERE id IN (
+            SELECT id FROM large_table 
+            WHERE computed_value IS NULL 
+            LIMIT 1000
+        );
+        EXIT WHEN NOT FOUND;
+        COMMIT;
+        PERFORM pg_sleep(0.01);
+    END LOOP;
+END $;
+```
+
+#### **Anti-Pattern: Dropping Data Without Warning**
+```sql
+-- ❌ EXTREMELY DANGEROUS
+DROP TABLE old_user_preferences;
+
+-- ✅ SAFE: Multi-phase approach
+-- Phase 1: Stop using table (code change)
+-- Phase 2: Rename to mark for deletion (V10)
+ALTER TABLE old_user_preferences RENAME TO deprecated_old_user_preferences;
+
+-- Phase 3: Actually drop after verification period (V11, weeks later)
+DROP TABLE IF EXISTS deprecated_old_user_preferences;
+```
+
+---
+
+## **17. Flyway CLI & Automation**
+
+### **17.1 Flyway Command Line**
+
+**Installation:**
+```bash
+# macOS
+brew install flyway
+
+# Linux
+wget -qO- https://repo1.maven.org/maven2/org/flywaydb/flyway-commandline/9.22.0/flyway-commandline-9.22.0-linux-x64.tar.gz | tar xvz
+
+# Windows
+# Download from https://flywaydb.org/download
+```
+
+**Configuration file (flyway.conf):**
+```properties
+flyway.url=jdbc:postgresql://localhost:5432/mydb
+flyway.user=dbuser
+flyway.password=dbpassword
+flyway.locations=filesystem:./sql
+flyway.baseline-on-migrate=true
+flyway.schemas=public
+```
+
+**Common Commands:**
+```bash
+# Show migration status
+flyway info
+
+# Apply pending migrations
+flyway migrate
+
+# Validate checksums
+flyway validate
+
+# Baseline existing database
+flyway baseline
+
+# Clean database (DANGEROUS!)
+flyway clean
+
+# Repair checksums
+flyway repair
+```
+
+### **17.2 CI/CD Integration**
+
+**GitHub Actions Example:**
+```yaml
+name: Database Migrations
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/main/resources/db/migration/**'
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Setup Java
+      uses: actions/setup-java@v3
+      with:
+        java-version: '17'
+        
+    - name: Install Flyway
+      run: |
+        wget -qO- https://repo1.maven.org/maven2/org/flywaydb/flyway-commandline/9.22.0/flyway-commandline-9.22.0-linux-x64.tar.gz | tar xvz
+        sudo ln -s `pwd`/flyway-9.22.0/flyway /usr/local/bin
+        
+    - name: Run Migrations on Staging
+      env:
+        FLYWAY_URL: ${{ secrets.STAGING_DB_URL }}
+        FLYWAY_USER: ${{ secrets.STAGING_DB_USER }}
+        FLYWAY_PASSWORD: ${{ secrets.STAGING_DB_PASSWORD }}
+      run: |
+        flyway info
+        flyway migrate
+        flyway validate
+        
+    - name: Notify on Success
+      if: success()
+      run: echo "Migrations applied successfully!"
+      
+    - name: Notify on Failure
+      if: failure()
+      run: echo "Migration failed! Rolling back deployment."
+```
+
+**Jenkins Pipeline Example:**
+```groovy
+pipeline {
+    agent any
+    
+    environment {
+        DB_URL = credentials('database-url')
+        DB_USER = credentials('database-user')
+        DB_PASSWORD = credentials('database-password')
+    }
+    
+    stages {
+        stage('Validate Migrations') {
+            steps {
+                sh 'flyway validate'
+            }
+        }
+        
+        stage('Apply Migrations') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh 'flyway migrate'
+            }
+        }
+        
+        stage('Verify') {
+            steps {
+                sh '''
+                    flyway info
+                    # Run smoke tests
+                    ./gradlew test --tests MigrationSmokeTest
+                '''
+            }
+        }
+    }
+    
+    post {
+        failure {
+            mail to: 'team@example.com',
+                 subject: "Migration Failed: ${env.JOB_NAME}",
+                 body: "Check ${env.BUILD_URL} for details"
+        }
+    }
+}
+```
+
+### **17.3 Docker Integration**
+
+**Dockerfile:**
+```dockerfile
+FROM openjdk:17-jdk-slim
+
+# Install Flyway
+RUN apt-get update && apt-get install -y wget && \
+    wget -qO- https://repo1.maven.org/maven2/org/flywaydb/flyway-commandline/9.22.0/flyway-commandline-9.22.0-linux-x64.tar.gz | tar xvz && \
+    ln -s /flyway-9.22.0/flyway /usr/local/bin/flyway
+
+# Copy migrations
+COPY src/main/resources/db/migration /flyway/sql
+
+# Copy Flyway config
+COPY flyway.conf /flyway/conf/
+
+WORKDIR /flyway
+
+ENTRYPOINT ["flyway"]
+CMD ["migrate"]
+```
+
+**Docker Compose:**
+```yaml
+version: '3.8'
+
+services:
+  database:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: mydb
+      POSTGRES_USER: dbuser
+      POSTGRES_PASSWORD: dbpassword
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      
+  flyway:
+    build: .
+    depends_on:
+      - database
+    environment:
+      FLYWAY_URL: jdbc:postgresql://database:5432/mydb
+      FLYWAY_USER: dbuser
+      FLYWAY_PASSWORD: dbpassword
+    command: migrate
+    
+volumes:
+  db_data:
+```
+
+---
+
+## **18. FAQs & Common Scenarios**
+
+### **Q1: Can I use Flyway with an existing database?**
+**A:** Yes! Use baseline:
+```yaml
+spring.flyway.baseline-on-migrate=true
+spring.flyway.baseline-version=1
+```
+Your first migration (V1) represents the existing state, and future migrations (V2+) add new changes.
+
+### **Q2: How do I handle multiple developers creating migrations simultaneously?**
+**A:** Use a version numbering system that reduces conflicts:
+```
+# Timestamp-based (recommended for teams)
+V20241007143000__alice_feature.sql
+V20241007143500__bob_feature.sql
+
+# Or use feature branches and merge carefully
+```
+
+### **Q3: Can I run migrations outside application startup?**
+**A:** Yes!
+```yaml
+# Disable automatic migration
+spring.flyway.enabled=false
+```
+Then run manually:
+```bash
+flyway migrate
+# Or use API:
+flyway.migrate();
+```
+
+### **Q4: How do I test migrations in production without applying them?**
+**A:** Use dry-run (Flyway Teams feature) or test on production copy:
+```bash
+# Create production database copy
+pg_dump production_db | psql test_db
+
+# Test migrations on copy
+flyway -configFiles=flyway-test.conf migrate
+```
+
+### **Q5: What if I need to rollback a migration?**
+**A:** Flyway doesn't auto-rollback. Create a new "undo" migration:
+```sql
+-- V10__add_column.sql
+ALTER TABLE users ADD COLUMN middle_name VARCHAR(100);
+
+-- If you need to undo, create:
+-- V11__remove_middle_name.sql
+ALTER TABLE users DROP COLUMN middle_name;
+```
+
+### **Q6: Can I use Flyway with MongoDB/NoSQL?**
+**A:** Flyway is designed for relational databases. For NoSQL, consider:
+- **MongoDB**: mongock, liquibase
+- **Cassandra**: Cassandra Migrate
+- **Elasticsearch**: Custom scripts
+
+### **Q7: How do I handle encrypted database passwords?**
+**A:** Use environment variables or secrets management:
+```yaml
+spring:
+  datasource:
+    password: ${DB_PASSWORD:defaultfordev}
+```
+Or use Spring Cloud Config, Vault, AWS Secrets Manager, etc.
+
+### **Q8: Can migrations run in parallel?**
+**A:** No, Flyway acquires a lock to ensure sequential execution. This prevents corruption.
+
+### **Q9: What's the maximum size for a migration file?**
+**A:** No hard limit, but keep migrations small and focused. Split large migrations into multiple steps.
+
+### **Q10: How do I version control database stored procedures?**
+**A:** Use repeatable migrations:
+```sql
+-- R__user_statistics_procedure.sql
+CREATE OR REPLACE FUNCTION calculate_user_stats()
+RETURNS TRIGGER AS $
+BEGIN
+    -- Procedure logic
+    RETURN NEW;
+END;
+$ LANGUAGE plpgsql;
+```
+
+---
+
+## **19. Resources & Tools**
+
+### **Official Resources**
+- 📚 [Flyway Documentation](https://flywaydb.org/documentation)
+- 💻 [Flyway GitHub](https://github.com/flyway/flyway)
+- 🎓 [Flyway Tutorial](https://flywaydb.org/documentation/getstarted/firststeps)
+- 📖 [Spring Boot + Flyway Guide](https://docs.spring.io/spring-boot/docs/current/reference/html/howto.html#howto.data-initialization.migration-tool.flyway)
+
+### **Tools & Plugins**
+- **IntelliJ IDEA Plugin**: Flyway support with validation
+- **VS Code Extension**: Flyway migration syntax highlighting
+- **DBeaver**: Database tool with Flyway integration
+- **Flyway Desktop**: GUI for Flyway (commercial)
+
+### **Related Technologies**
+- **Liquibase**: Alternative migration tool
+- **Test containers**: Test migrations with real databases
+- **DbUnit**: Database testing framework
+- **JPA**: Complement Flyway with entity mapping
+
+### **Community**
+- Stack Overflow: [flyway tag](https://stackoverflow.com/questions/tagged/flyway)
+- Reddit: r/java, r/SpringBoot
+- Flyway Discussion Forum
+
+---
+
+## **Appendix A: Complete Example Project**
+
+**Project Structure:**
+```
+spring-boot-flyway-demo/
+├── src/
+│   ├── main/
+│   │   ├── java/
+│   │   │   └── com/example/demo/
+│   │   │       ├── DemoApplication.java
+│   │   │       ├── entity/
+│   │   │       │   └── User.java
+│   │   │       ├── repository/
+│   │   │       │   └── UserRepository.java
+│   │   │       └── config/
+│   │   │           └── FlywayCallback.java
+│   │   └── resources/
+│   │       ├── application.yml
+│   │       ├── application-dev.yml
+│   │       ├── application-prod.yml
+│   │       └── db/
+│   │           └── migration/
+│   │               ├── V1__create_users_table.sql
+│   │               ├── V2__add_user_preferences.sql
+│   │               ├── V3__create_orders_table.sql
+│   │               └── R__user_statistics_view.sql
+│   └── test/
+│       └── java/
+│           └── com/example/demo/
+│               └── FlywayMigrationTest.java
+├── pom.xml
+└── README.md
+```
+
+This documentation provides everything you need from basics to production-ready practices. Save it, share it with your team, and refer to it whenever you need guidance on database migrations with Flyway!
+
+---
+
+**Last Updated**: October 2024  
+**Version**: 1.0  
+**Maintained by**: Your Development Team
